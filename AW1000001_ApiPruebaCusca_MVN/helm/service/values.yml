@@ -1,0 +1,61 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+image:
+  repository: "861536898248.dkr.ecr.us-east-1.amazonaws.com/pruebatecnica/cusca"
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+containerPort: 8081
+
+service:
+  type: ClusterIP
+  port: 80
+
+secret:
+  existingSecret: demo-service-secret
+  key: APP_SECRET
+
+config:
+  secretMask: false
+  name: demo-service
+  environment: development
+  message: "Configuracion simulada leida desde application.yml"
+  featureEnabled: true
+
+probes:
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 10
+    periodSeconds: 5
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+ingress:
+  enabled: false
+  className: alb
+  scheme: internet-facing
+  targetType: ip
+  host: ""
+  path: /
+  pathType: Prefix
+  healthcheckPath: /actuator/health/readiness
+  successCodes: "200"
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70

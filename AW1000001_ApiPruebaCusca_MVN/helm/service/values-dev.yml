@@ -1,0 +1,11 @@
+replicaCount: 1
+
+config:
+  environment: development
+  featureEnabled: true
+
+ingress:
+  enabled: false
+
+autoscaling:
+  enabled: false

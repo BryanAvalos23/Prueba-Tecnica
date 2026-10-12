@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkit
+  namespace: prueba-cusca
+  labels:
+    app: buildkit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: buildkit
+  template:
+    metadata:
+      labels:
+        app: buildkit
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.25.1-rootless
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --oci-worker-no-process-sandbox
+          ports:
+            - name: buildkit
+              containerPort: 1234
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: Unconfined
+            appArmorProfile:
+              type: Unconfined
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: buildkit-data
+              mountPath: /home/user/.local/share/buildkit
+      volumes:
+        - name: buildkit-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkit
+  namespace: prueba-cusca
+  labels:
+    app: buildkit
+spec:
+  type: ClusterIP
+  selector:
+    app: buildkit
+  ports:
+    - name: buildkit
+      port: 1234
+      targetPort: buildkit
+      protocol: TCP

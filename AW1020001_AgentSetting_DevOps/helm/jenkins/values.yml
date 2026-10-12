@@ -1,0 +1,62 @@
+namespaceOverride: prueba-cusca
+
+controller:
+  componentName: jenkins-controller
+  serviceType: ClusterIP
+  agentListenerServiceType: ClusterIP
+  agentListenerEnabled: true
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "2Gi"
+
+  installLatestPlugins: false
+  installPlugins:
+    - kubernetes:4557.ve746270f672f
+    - workflow-aggregator:608.v67378e9d3db_1
+    - git:5.10.1
+    - configuration-as-code:2121.v86fe99d4b_b_a_b_
+
+  JCasC:
+    defaultConfig: true
+    configScripts: {}
+
+persistence:
+  enabled: true
+  size: 8Gi
+  accessMode: ReadWriteOnce
+  storageClass: gp3-csi
+
+serviceAccount:
+  create: true
+  name: jenkins
+  automountServiceAccountToken: true
+
+rbac:
+  create: false
+
+serviceAccountAgent:
+  create: true
+  name: jenkins-agent
+  automountServiceAccountToken: false
+
+agent:
+  enabled: true
+  namespace: prueba-cusca
+  useDefaultServiceAccount: true
+  serviceAccount: jenkins-agent
+  containerCap: 3
+  privileged: false
+  restrictedPssSecurityContext: true
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"

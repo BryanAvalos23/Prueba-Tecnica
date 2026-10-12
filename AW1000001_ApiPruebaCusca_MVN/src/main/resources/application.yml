@@ -1,0 +1,31 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: demo-service
+
+app:
+  secret:
+    value: ${APP_SECRET}
+    mask: ${APP_SECRET_MASK:false}
+  simulated:
+    name: ${APP_CONFIG_NAME:demo-service}
+    environment: ${APP_CONFIG_ENVIRONMENT:development}
+    message: ${APP_CONFIG_MESSAGE:Configuracion simulada leida desde application.yml}
+    feature-enabled: ${APP_CONFIG_FEATURE_ENABLED:true}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true  
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true

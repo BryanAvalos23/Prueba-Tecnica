@@ -1,0 +1,8 @@
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: vault-connection
+  namespace: prueba-cusca
+spec:
+  address: http://vault.prueba-cusca.svc:8200
+  skipTLSVerify: false

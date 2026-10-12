@@ -1,0 +1,657 @@
+name: Agente EKS - Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      fase:
+        description: "Fase del bootstrap que se desea ejecutar"
+        required: true
+        type: choice
+        options:
+          - vault
+          - jenkins
+          - vso
+          - buildkit
+        default: vault
+
+permissions:
+  contents: read
+
+jobs:
+  previo:
+    name: Validar configuración del repositorio
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validar Bash
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash --version
+          bash -n scripts/previo.sh
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Instalar herramientas de validación
+        run: python -m pip install yamllint PyYAML
+
+      - name: Validar archivos YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yamllint -d relaxed \
+            .github/workflows/bootstrap.yml \
+            helm/jenkins/values.yml \
+            helm/vault/values.yml \
+            helm/vso/values.yml \
+            k8s/namespace.yml \
+            k8s/storage/gp3-csi.yml \
+            k8s/rbac/jenkins-serviceaccount.yml \
+            k8s/rbac/jenkins-role.yml \
+            k8s/rbac/jenkins-rolebinding.yml \
+            k8s/rbac/vault-token-reviewer.yml \
+            k8s/vso/jenkins-vault-serviceaccount.yml \
+            k8s/vso/vault-connection.yml \
+            k8s/vso/vault-auth.yml \
+            k8s/vso/vault-static-secret.yml \
+            k8s/csi/vault-secret-provider-class.yml \
+            k8s/buildkit/buildkit.yml
+
+      - name: Configurar Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Agregar repositorios Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm repo add jenkins https://charts.jenkins.io
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo add secrets-store-csi-driver \
+            https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+          helm repo update
+
+      - name: Descargar charts Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/helm-charts
+          mkdir -p /tmp/helm-charts
+
+          helm pull jenkins/jenkins \
+            --version 5.9.56 --untar --untardir /tmp/helm-charts
+
+          helm pull hashicorp/vault \
+            --version 0.34.1 --untar --untardir /tmp/helm-charts
+
+          helm pull hashicorp/vault-secrets-operator \
+            --version 1.6.0 --untar --untardir /tmp/helm-charts
+
+          helm pull secrets-store-csi-driver/secrets-store-csi-driver \
+            --version 1.6.1 --untar --untardir /tmp/helm-charts
+
+      - name: Validar charts Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm lint /tmp/helm-charts/jenkins \
+            --values helm/jenkins/values.yml
+
+          helm lint /tmp/helm-charts/vault \
+            --values helm/vault/values.yml
+
+          helm lint /tmp/helm-charts/vault-secrets-operator \
+            --values helm/vso/values.yml
+
+      - name: Renderizar manifiestos Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm template jenkins /tmp/helm-charts/jenkins \
+            --namespace prueba-cusca \
+            --values helm/jenkins/values.yml \
+            > /tmp/jenkins-rendered.yml
+
+          helm template vault /tmp/helm-charts/vault \
+            --namespace prueba-cusca \
+            --values helm/vault/values.yml \
+            > /tmp/vault-rendered.yml
+
+          helm template vault-secrets-operator \
+            /tmp/helm-charts/vault-secrets-operator \
+            --namespace prueba-cusca \
+            --values helm/vso/values.yml \
+            > /tmp/vso-rendered.yml
+
+          helm template csi-secrets-store \
+            /tmp/helm-charts/secrets-store-csi-driver \
+            --namespace kube-system \
+            > /tmp/csi-driver-rendered.yml
+
+      - name: Validar RBAC de Jenkins
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import yaml
+
+          files = {
+              "serviceaccount": "k8s/rbac/jenkins-serviceaccount.yml",
+              "role": "k8s/rbac/jenkins-role.yml",
+              "rolebinding": "k8s/rbac/jenkins-rolebinding.yml",
+          }
+
+          docs = {}
+          for key, path in files.items():
+              with open(path, encoding="utf-8") as f:
+                  docs[key] = yaml.safe_load(f)
+
+          sa = docs["serviceaccount"]
+          role = docs["role"]
+          binding = docs["rolebinding"]
+
+          assert sa["kind"] == "ServiceAccount"
+          assert sa["metadata"]["name"] == "jenkins"
+          assert sa["metadata"]["namespace"] == "prueba-cusca"
+
+          assert role["kind"] == "Role"
+          assert role["metadata"]["name"] == "jenkins-agent-manager"
+          assert role["metadata"]["namespace"] == "prueba-cusca"
+
+          assert binding["kind"] == "RoleBinding"
+          assert binding["metadata"]["namespace"] == "prueba-cusca"
+          assert binding["roleRef"]["kind"] == "Role"
+          assert binding["roleRef"]["name"] == role["metadata"]["name"]
+
+          assert any(
+              s.get("kind") == "ServiceAccount"
+              and s.get("name") == sa["metadata"]["name"]
+              and s.get("namespace") == sa["metadata"]["namespace"]
+              for s in binding["subjects"]
+          )
+
+          print("[OK] RBAC de Jenkins validado")
+          PY
+
+      - name: Validar SecretProviderClass CSI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import yaml
+
+          path = "k8s/csi/vault-secret-provider-class.yml"
+          with open(path, encoding="utf-8") as f:
+              doc = yaml.safe_load(f)
+
+          assert doc["apiVersion"] == "secrets-store.csi.x-k8s.io/v1"
+          assert doc["kind"] == "SecretProviderClass"
+          assert doc["metadata"]["namespace"] == "prueba-cusca"
+          assert doc["spec"]["provider"] == "vault"
+
+          params = doc["spec"]["parameters"]
+          assert params.get("vaultAddress")
+          assert params.get("roleName")
+
+          objects = yaml.safe_load(params.get("objects", ""))
+          assert isinstance(objects, list) and objects
+
+          for obj in objects:
+              assert obj.get("objectName")
+              assert obj.get("secretPath")
+              assert obj.get("secretKey")
+
+          print("[OK] SecretProviderClass validado")
+          PY
+
+      - name: Validar políticas Vault
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s vault/policies/app-csi.hcl
+          test -s vault/policies/jenkins-vso.hcl
+
+          grep -Fq 'path "secret/data/test-app"' \
+            vault/policies/app-csi.hcl
+          grep -Fq 'capabilities = ["read"]' \
+            vault/policies/app-csi.hcl
+
+          grep -Fq 'path "secret/data/jenkins/test"' \
+            vault/policies/jenkins-vso.hcl
+          grep -Fq 'capabilities = ["read"]' \
+            vault/policies/jenkins-vso.hcl
+
+          echo "[OK] Políticas CSI y VSO presentes"
+
+      - name: Ejecutar preflight
+        run: bash scripts/previo.sh
+
+  Deploy-vault:
+    name: Desplegar Vault
+    runs-on: self-hosted
+    needs: previo
+    if: ${{ inputs.fase == 'vault' }}
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: prueba-tecnica-cusca-eks-cluster-deploy
+      K8S_NAMESPACE: prueba-cusca
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Autenticar con AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+
+      - name: Instalar Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Configurar acceso al cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Verificar acceso a Kubernetes
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Crear namespace
+        run: kubectl apply -f k8s/namespace.yml
+
+      - name: Configurar StorageClass EBS CSI
+        run: |
+          kubectl apply -f k8s/storage/gp3-csi.yml
+          kubectl get storageclass gp3-csi
+
+      - name: Desplegar Vault
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo update
+
+          helm upgrade --install vault hashicorp/vault \
+            --namespace "$K8S_NAMESPACE" \
+            --version 0.34.1 \
+            --values helm/vault/values.yml \
+            --timeout 5m
+
+      - name: Comprobar recursos de Vault
+        run: |
+          kubectl get pods,services,pvc -n "$K8S_NAMESPACE"
+          kubectl rollout status statefulset/vault \
+            -n "$K8S_NAMESPACE" --timeout=180s
+
+  Deploy-jenkins:
+    name: Desplegar Jenkins
+    runs-on: self-hosted
+    needs: previo
+    if: ${{ inputs.fase == 'jenkins' }}
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: prueba-tecnica-cusca-eks-cluster-deploy
+      K8S_NAMESPACE: prueba-cusca
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Autenticar con AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+
+      - name: Instalar Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Configurar acceso al cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Aplicar RBAC de Jenkins
+        run: |
+          kubectl apply -f k8s/rbac/jenkins-serviceaccount.yml
+          kubectl apply -f k8s/rbac/jenkins-role.yml
+          kubectl apply -f k8s/rbac/jenkins-rolebinding.yml
+
+      - name: Verificar permisos de Jenkins
+        run: |
+          kubectl auth can-i list configmaps \
+            -n "$K8S_NAMESPACE" \
+            --as="system:serviceaccount:${K8S_NAMESPACE}:jenkins" \
+            | grep -qx yes
+
+      - name: Agregar repositorio Jenkins
+        run: |
+          helm repo add jenkins https://charts.jenkins.io
+          helm repo update
+
+      - name: Desplegar Jenkins
+        run: |
+          helm upgrade --install jenkins jenkins/jenkins \
+            --namespace "$K8S_NAMESPACE" \
+            --version 5.9.56 \
+            --values helm/jenkins/values.yml \
+            --timeout 10m \
+            --wait
+
+      - name: Comprobar recursos desplegados
+        run: |
+          kubectl get pods,services,pvc -n "$K8S_NAMESPACE"
+          kubectl rollout status statefulset/jenkins \
+            -n "$K8S_NAMESPACE" --timeout=300s
+
+  Deploy-vso:
+    name: Desplegar Vault Secrets Operator
+    runs-on: self-hosted
+    needs: previo
+    if: ${{ inputs.fase == 'vso' }}
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: prueba-tecnica-cusca-eks-cluster-deploy
+      K8S_NAMESPACE: prueba-cusca
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Autenticar con AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+
+      - name: Instalar Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Configurar acceso al cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Verificar que Vault está accesible
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl run vault-health-check \
+            --namespace "$K8S_NAMESPACE" \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --rm -i \
+            --command -- \
+            curl -fsS http://vault.prueba-cusca.svc:8200/v1/sys/health
+
+      - name: Agregar repositorio HashiCorp
+        run: |
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo update
+
+      - name: Instalar VSO
+        run: |
+          helm upgrade --install vault-secrets-operator \
+            hashicorp/vault-secrets-operator \
+            --namespace "$K8S_NAMESPACE" \
+            --version 1.6.0 \
+            --values helm/vso/values.yml \
+            --timeout 5m \
+            --wait
+
+      - name: Aplicar recursos Vault-VSO
+        run: |
+          kubectl apply -f k8s/vso/jenkins-vault-serviceaccount.yml
+          kubectl apply -f k8s/vso/vault-connection.yml
+          kubectl apply -f k8s/vso/vault-auth.yml
+          kubectl apply -f k8s/vso/vault-static-secret.yml
+
+      - name: Comprobar recursos VSO
+        run: |
+          kubectl get pods -n "$K8S_NAMESPACE"
+          kubectl get vaultconnection,vaultauth,vaultstaticsecret \
+            -n "$K8S_NAMESPACE"
+
+  Validate-vso:
+    name: Validar sincronización de VSO
+    runs-on: self-hosted
+    needs: Deploy-vso
+    if: ${{ inputs.fase == 'vso' }}
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: prueba-tecnica-cusca-eks-cluster-deploy
+      K8S_NAMESPACE: prueba-cusca
+
+    steps:
+      - name: Autenticar con AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+
+      - name: Configurar acceso al cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Esperar sincronización correcta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for _ in $(seq 1 60); do
+            READY="$(kubectl get vaultstaticsecret jenkins-vault-secret \
+              -n "$K8S_NAMESPACE" \
+              -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' \
+              2>/dev/null || true)"
+
+            SECRET_EXISTS=false
+            if kubectl get secret jenkins-vault-secret \
+              -n "$K8S_NAMESPACE" >/dev/null 2>&1; then
+              SECRET_EXISTS=true
+            fi
+
+            if [[ "$READY" == "True" && "$SECRET_EXISTS" == "true" ]]; then
+              echo "[OK] VSO está listo y el Secret existe."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "::error::VSO no sincronizó el Secret dentro del tiempo esperado."
+          kubectl get vaultstaticsecret jenkins-vault-secret \
+            -n "$K8S_NAMESPACE" -o yaml
+          exit 1
+
+  Deploy-buildkit:
+    name: Desplegar BuildKit rootless
+    runs-on: self-hosted
+    needs: previo
+    if: ${{ inputs.fase == 'buildkit' }}
+    environment: prod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: prueba-tecnica-cusca-eks-cluster-deploy
+      K8S_NAMESPACE: prueba-cusca
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Autenticar con AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+
+      - name: Configurar acceso al cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Verificar prerrequisitos
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get namespace "$K8S_NAMESPACE"
+          kubectl get nodes
+          test -s k8s/buildkit/buildkit.yml
+
+      - name: Validar manifiesto BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            --dry-run=client \
+            -f k8s/buildkit/buildkit.yml
+
+      - name: Desplegar BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl apply \
+            -f k8s/buildkit/buildkit.yml
+
+      - name: Esperar Deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status deployment/buildkit \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+      - name: Validar Service y endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get service buildkit \
+            -n "$K8S_NAMESPACE"
+
+          kubectl get endpointslice \
+            -n "$K8S_NAMESPACE" \
+            -l kubernetes.io/service-name=buildkit
+
+          ENDPOINTS="$(kubectl get endpointslice \
+            -n "$K8S_NAMESPACE" \
+            -l kubernetes.io/service-name=buildkit \
+            -o jsonpath='{.items[*].endpoints[*].addresses[*]}')"
+
+          if [[ -z "$ENDPOINTS" ]]; then
+            echo "::error::El Service buildkit no tiene endpoints disponibles."
+            exit 1
+          fi
+
+      - name: Validar daemon BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl exec deployment/buildkit \
+            -n "$K8S_NAMESPACE" \
+            -c buildkitd -- \
+            buildctl \
+              --addr tcp://127.0.0.1:1234 \
+              debug workers
+
+      - name: Resumen de recursos
+        if: always()
+        run: |
+          kubectl get deployment,pods,services \
+            -n "$K8S_NAMESPACE" \
+            -l app=buildkit || true
+
+          kubectl logs deployment/buildkit \
+            -n "$K8S_NAMESPACE" \
+            -c buildkitd \
+            --tail=50 || true

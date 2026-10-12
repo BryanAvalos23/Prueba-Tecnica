@@ -1,0 +1,320 @@
+pipeline {
+  agent {
+    kubernetes {
+      defaultContainer 'maven'
+      yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: prueba-cusca
+spec:
+  serviceAccountName: jenkins
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  containers:
+    - name: maven
+      image: maven:3.9-eclipse-temurin-21
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: HOME
+          value: /home/jenkins/agent
+
+    - name: aws
+      image: amazon/aws-cli:latest
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: HOME
+          value: /tmp
+        - name: KUBECONFIG
+          value: /dockercfg/kubeconfig
+        - name: PATH
+          value: /tools:/usr/local/bin:/usr/bin:/bin
+      volumeMounts:
+        - name: dockercfg
+          mountPath: /dockercfg
+        - name: tools
+          mountPath: /tools
+
+    - name: buildkit
+      image: moby/buildkit:v0.25.1-rootless
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: APP_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: jenkins-vault-secret
+              key: APP_SECRET
+      volumeMounts:
+        - name: dockercfg
+          mountPath: /dockercfg
+
+    - name: helm
+      image: alpine/helm:3.17.3
+      command: ["sh", "-c"]
+      args: ["sleep infinity"]
+      volumeMounts:
+        - name: tools
+          mountPath: /tools
+
+    - name: jnlp
+      image: jenkins/inbound-agent:3391.va_37fa_a_305d6d-1-jdk25
+      workingDir: /home/jenkins/agent
+
+  volumes:
+    - name: dockercfg
+      emptyDir: {}
+    - name: tools
+      emptyDir: {}
+'''
+    }
+  }
+
+  environment {
+    AWS_REGION = 'us-east-1'
+
+    ECR_REGISTRY = '861536898248.dkr.ecr.us-east-1.amazonaws.com'
+    ECR_REPOSITORY = 'pruebatecnica/cusca'
+    IMAGE_TAG = 'latest'
+
+    BUILDKIT_ADDR = 'tcp://buildkit.prueba-cusca.svc.cluster.local:1234'
+
+    EKS_APP_CLUSTER = 'prueba-tecnica-cusca-eks-cluster-app'
+    EKS_DEPLOY_ROLE_ARN = 'arn:aws:iam::861536898248:role/prueba-tecnica-cusca-eks-admin-role-app'
+
+    K8S_NAMESPACE = 'demo-service-prod'
+    HELM_RELEASE = 'demo-service'
+
+    ALB_CONTROLLER_RELEASE = 'aws-load-balancer-controller'
+    ALB_CONTROLLER_CHART_VERSION = '3.6.0'
+  }
+
+  stages {
+    stage('Build and Test') {
+      steps {
+        echo 'Starting Maven build and tests'
+
+        checkout scm
+
+        container('maven') {
+          sh '''
+            set -eu
+
+            echo "=== Java ==="
+            java -version
+
+            echo "=== Maven ==="
+            chmod +x mvnw
+            ./mvnw -B clean verify
+          '''
+        }
+      }
+    }
+
+    stage('Validate AWS Identity and BuildKit') {
+      steps {
+        container('aws') {
+          sh '''
+            set +x
+            set -eu
+
+            echo "=== AWS CLI ==="
+            aws --version
+
+            echo "=== AWS Identity ==="
+            aws sts get-caller-identity
+          '''
+        }
+
+        container('buildkit') {
+          sh '''
+            set +x
+            set -eu
+
+            echo "=== BuildKit client ==="
+            buildctl --version
+
+            echo "=== BuildKit workers ==="
+            buildctl --addr "$BUILDKIT_ADDR" debug workers
+
+            echo "=== Secret availability ==="
+            test -n "$APP_SECRET"
+            echo "APP_SECRET is available; value not displayed."
+          '''
+        }
+      }
+    }
+
+    stage('Build and Push to ECR') {
+      steps {
+        container('aws') {
+          sh '''
+            set +x
+            set -eu
+            umask 077
+
+            echo "=== ECR Authentication ==="
+
+            ECR_PASSWORD="$(aws ecr get-login-password \
+              --region "$AWS_REGION")"
+
+            AUTH="$(printf 'AWS:%s' "$ECR_PASSWORD" \
+              | base64 | tr -d '\\n')"
+
+            printf '{"auths":{"%s":{"auth":"%s"}}}\\n' \
+              "$ECR_REGISTRY" "$AUTH" \
+              > /dockercfg/config.json
+
+            unset ECR_PASSWORD AUTH
+
+            echo "ECR authentication config created."
+          '''
+        }
+
+        container('buildkit') {
+          sh '''
+            set +x
+            set -eu
+
+            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            export DOCKER_CONFIG=/dockercfg
+
+            echo "=== Build and Push ==="
+            echo "Image: ${IMAGE_URI}"
+
+            test -n "$APP_SECRET"
+
+            buildctl --addr "$BUILDKIT_ADDR" build \
+              --frontend dockerfile.v0 \
+              --local context=. \
+              --local dockerfile=. \
+              --opt "build-arg:APP_SECRET=${APP_SECRET}" \
+              --output "type=image,name=${IMAGE_URI},push=true"
+
+            echo "BuildKit push completed."
+          '''
+        }
+
+        container('aws') {
+          sh '''
+            set +x
+            set -eu
+
+            echo "=== Verify Image in ECR ==="
+
+            aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query 'imageDetails[0].{Tag:imageTags[0],Digest:imageDigest}' \
+              --output table
+
+            echo "Image published successfully."
+          '''
+        }
+      }
+    }
+
+    stage('Prepare Helm') {
+      steps {
+        container('helm') {
+          sh '''
+            set -eu
+
+            echo "=== Preparing Helm binary ==="
+
+            cp "$(command -v helm)" /tools/helm
+            chmod 755 /tools/helm
+
+            /tools/helm version
+          '''
+        }
+      }
+    }
+
+    stage('Configure EKS App Cluster') {
+      steps {
+        container('aws') {
+          sh '''
+            set +x
+            set -eu
+
+            echo "=== AWS identity for deployment ==="
+            aws sts get-caller-identity
+
+            echo "=== Configure EKS application cluster ==="
+
+            aws eks update-kubeconfig \
+              --region "$AWS_REGION" \
+              --name "$EKS_APP_CLUSTER" \
+              --role-arn "$EKS_DEPLOY_ROLE_ARN" \
+              --kubeconfig "$KUBECONFIG"
+
+            echo "EKS kubeconfig configured."
+          '''
+        }
+      }
+    }
+
+    stage('Deploy Application with Ingress') {
+      steps {
+        container('aws') {
+          sh '''
+            set +x
+            set -eu
+
+            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+            echo "=== Validate application chart ==="
+
+            /tools/helm lint helm/service \
+              --values helm/service/values-prod.yml
+
+            echo "=== Deploy application and enable Ingress ==="
+
+            /tools/helm upgrade --install "$HELM_RELEASE" \
+              helm/service \
+              --namespace "$K8S_NAMESPACE" \
+              --create-namespace \
+              --values helm/service/values-prod.yml \
+              --set-string image.repository="$IMAGE_URI" \
+              --set-string image.tag="$IMAGE_TAG" \
+              --set-string image.pullPolicy=Always \
+              --set ingress.enabled=true \
+              --wait \
+              --atomic \
+              --timeout 5m
+
+            echo "=== Application release status ==="
+
+            /tools/helm status "$HELM_RELEASE" \
+              --namespace "$K8S_NAMESPACE"
+
+            echo "Application deployment with Ingress completed."
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'Pipeline finalized. Kubernetes will remove the ephemeral agent pod.'
+    }
+
+    success {
+      echo 'Pipeline completed: tests passed, image published, controller installed, and application deployed.'
+    }
+
+    failure {
+      echo 'Pipeline failed. Review the stage logs to identify the cause.'
+    }
+  }
+}

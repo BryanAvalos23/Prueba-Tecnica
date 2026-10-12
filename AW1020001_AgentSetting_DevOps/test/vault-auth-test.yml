@@ -1,0 +1,43 @@
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vault-auth-test
+  namespace: prueba-cusca
+spec:
+  serviceAccountName: jenkins
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: python:3.12-alpine
+      command: ["python", "-c"]
+      args:
+        - |
+          import json
+          import urllib.request
+
+          with open("/var/run/secrets/kubernetes.io/serviceaccount/token") as f:
+              jwt = f.read().strip()
+
+          payload = json.dumps({
+              "role": "jenkins",
+              "jwt": jwt
+          }).encode()
+
+          req = urllib.request.Request(
+              "http://vault:8200/v1/auth/kubernetes/login",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  result = json.loads(response.read())
+              auth = result.get("auth", {})
+              print("Autenticacion: OK")
+              print("Politicas:", auth.get("policies", []))
+              print("TTL:", auth.get("lease_duration"), "segundos")
+          except Exception as e:
+              print("Autenticacion fallida:", str(e))
+              raise

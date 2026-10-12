@@ -1,0 +1,61 @@
+global:
+  enabled: true
+  tlsDisable: true
+
+injector:
+  enabled: false
+
+server:
+  enabled: true
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+  dataStorage:
+    enabled: true
+    size: 8Gi
+    accessMode: ReadWriteOnce
+    storageClass: gp3-csi
+
+  auditStorage:
+    enabled: false
+
+  standalone:
+    enabled: false
+
+  ha:
+    enabled: true
+    replicas: 1
+
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+
+        cluster_name = "eks-agent-vault"
+
+        listener "tcp" {
+          address = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_disable = 1
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+        }
+
+        service_registration "kubernetes" {}
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
+  externalPort: 8200
+
+csi:
+  enabled: false

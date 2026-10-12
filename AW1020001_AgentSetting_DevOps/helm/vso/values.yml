@@ -1,0 +1,8 @@
+defaultVaultConnection:
+  enabled: false
+
+defaultAuthMethod:
+  enabled: false
+
+csi:
+  enabled: false
